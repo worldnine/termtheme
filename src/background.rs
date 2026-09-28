@@ -94,12 +94,21 @@ pub fn query_background() -> Option<Rgb> {
                 deadline.saturating_duration_since(now).as_millis() as i32,
             )
         };
+        // シグナル（SIGWINCH など）で起こされたら、締め切りまで待ち直す。写しの 3 本は
+        // ここで諦めていた（読み手が SIGWINCH を受けている間に判定し直すと、ペインの大きさが
+        // 変わっただけで答えを待たずに戻った）。
+        if n < 0 && interrupted() {
+            continue;
+        }
         if n <= 0 {
             break; // 時間切れか失敗
         }
         // libc::read で読む（std の Stdin はバッファを持つので、その後で読む者が取りこぼす）。
         // SAFETY: buf の長さまでを書かせる。
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 && interrupted() {
+            continue;
+        }
         if n <= 0 {
             break;
         }
@@ -110,6 +119,12 @@ pub fn query_background() -> Option<Rgb> {
     }
     crate::input::stash(&leftover(&resp));
     parse_osc11(&resp)
+}
+
+/// 直前のシステムコールがシグナルで中断されたか（EINTR）。
+#[cfg(unix)]
+fn interrupted() -> bool {
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
 }
 
 #[cfg(not(unix))]

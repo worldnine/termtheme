@@ -6,112 +6,122 @@
 //! 端末ならそれを読み、ほかの fd を指せない）。fd 0 はプロセスに 1 つなので、テストは 1 本に
 //! まとめて順に確かめる。
 //!
+//! # 時間に頼らない
+//!
+//! crossterm は別のスレッドで読ませ、`poll` を**頼んだときに 1 回だけ**呼ぶ（回しっぱなしに
+//! すると、区間をまたいだ結果が混ざる）。送ったバイトは入力の列に全部載ったのを確かめてから
+//! poll を頼むので、crossterm はそれを 1 回で読む。「止まっている」は、その poll が
+//! `c` を送るまで戻らないこと（戻るはずの 100 ms を大きく過ぎても答えが無く、`c` で戻る）と、
+//! 知らせの後ろのキーが 1 つも届かないことで確かめる。
+//!
+//! # SIGWINCH は無視する
+//!
+//! crossterm は、SIGWINCH と端末の入力を同じ回に受けると `Resize` だけを返し、入力は次の
+//! 入力が来るまで読まない（mio の kqueue はエッジで知らせるので、読みそこねた「読める」は
+//! 二度と来ない。macOS で確かめた）。これは 2031 とは別の問題で、外から SIGWINCH が届くと
+//! （テストを走らせている herdr のペインの大きさが変わるなど）このテストの入力が届かなく
+//! なる。そこで crossterm の読み手を作った直後に SIGWINCH を無視にする（signal-hook の
+//! ハンドラを外す）。
+//!
 //! crossterm の版を上げてこのテストが落ちたら、振る舞いが変わったということ。`input` の
 //! 冒頭の doc と合わせて見直す。
 
 #![cfg(unix)]
 
-use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+mod common;
+
+use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use common::PATIENCE;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-/// pty を開き、slave を fd 0 に差し替える。返すのは端末側（master）。
-fn stdin_on_a_pty() -> std::fs::File {
-    let (mut master, mut slave) = (-1, -1);
-    let mut size = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: 出力先の fd 2 つと winsize を渡す（macOS は `*mut`、Linux は `*const` を取る）。
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
-    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    // SAFETY: openpty が開いた fd の持ち主になる。
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    // SAFETY: slave は開いている。fd 0 を置き換えるだけ。
-    assert_eq!(
-        unsafe { libc::dup2(slave.as_raw_fd(), libc::STDIN_FILENO) },
-        libc::STDIN_FILENO
-    );
-    // SAFETY: 同上（master の持ち主になる）。
-    unsafe { std::fs::File::from_raw_fd(master) }
+/// crossterm に poll を頼む別のスレッド。1 回頼むと、1 回答える（`Some(event)` は poll が
+/// `true` で、続けて read したもの。`None` は poll が `false`）。
+struct Crossterm {
+    ask: mpsc::Sender<Duration>,
+    answer: mpsc::Receiver<Option<Event>>,
 }
 
-/// 端末が送ったことにする。
-fn terminal_sends(master: &mut std::fs::File, bytes: &[u8]) {
-    master.write_all(bytes).unwrap();
-    master.flush().unwrap();
-}
+impl Crossterm {
+    fn start() -> Self {
+        let (ask, asked) = mpsc::channel::<Duration>();
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(timeout) = asked.recv() {
+                let event = event::poll(timeout)
+                    .unwrap()
+                    .then(|| event::read().unwrap());
+                if answered.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { ask, answer }
+    }
 
-/// crossterm の `poll(100ms)` 1 回の結果。
-struct Polled {
-    /// `true` なら続けて `read()` した結果。
-    event: Option<Event>,
-    /// `poll` が戻るまでにかかった時間。
-    took: Duration,
-}
+    /// `poll(timeout)` を 1 回頼み、答えを `wait` まで待つ（答えが無ければ `None`）。
+    fn poll(&self, timeout: Duration, wait: Duration) -> Option<Option<Event>> {
+        self.ask.send(timeout).unwrap();
+        self.answer.recv_timeout(wait).ok()
+    }
 
-/// 別スレッドで crossterm の `poll(100ms)` → `read()` を回し、1 回ごとの結果を流す。
-/// crossterm の読み手が止まっても、テストは止まらずに「戻ってこない」を観測できる。
-fn crossterm_polls() -> mpsc::Receiver<Polled> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        loop {
-            let start = Instant::now();
-            let ready = match event::poll(Duration::from_millis(100)) {
-                Ok(ready) => ready,
-                Err(_) => return,
-            };
-            let took = start.elapsed();
-            let event = ready.then(|| event::read().unwrap());
-            if tx.send(Polled { event, took }).is_err() {
-                return;
+    /// 頼んだ poll の答えを、改めて `wait` まで待つ。
+    fn answer(&self, wait: Duration) -> Option<Option<Event>> {
+        self.answer.recv_timeout(wait).ok()
+    }
+
+    /// イベントを `n` 個読む。大きさの変化は数えない（SIGWINCH を無視にする前に届いた分）。
+    fn events(&self, n: usize) -> Vec<Event> {
+        let until = Instant::now() + PATIENCE;
+        let mut got = Vec::new();
+        while got.len() < n {
+            assert!(Instant::now() < until, "{n} 個届かない: {got:?}");
+            match self.poll(Duration::from_millis(100), PATIENCE) {
+                Some(Some(Event::Resize(..))) | Some(None) => {}
+                Some(Some(event)) => got.push(event),
+                None => panic!("poll が戻らない（読んだイベント: {got:?}）"),
             }
         }
-    });
-    rx
-}
+        got
+    }
 
-/// `wait` のあいだに戻ってきた poll をまとめたもの。
-struct Collected {
-    events: Vec<Event>,
-    /// 戻ってきた poll の数。100 ms の poll なら、止まっていない限り 400 ms で数回は戻る。
-    polls: usize,
-    /// いちばん長くかかった poll。
-    longest: Duration,
-}
-
-/// `wait` のあいだに戻ってきた poll の結果を集める。
-fn collect(rx: &mpsc::Receiver<Polled>, wait: Duration) -> Collected {
-    let until = Instant::now() + wait;
-    let mut c = Collected {
-        events: Vec::new(),
-        polls: 0,
-        longest: Duration::ZERO,
-    };
-    while let Some(left) = until.checked_duration_since(Instant::now()) {
-        match rx.recv_timeout(left) {
-            Ok(p) => {
-                c.polls += 1;
-                c.longest = c.longest.max(p.took);
-                c.events.extend(p.event);
+    /// 読めるイベントがもう無い（大きさの変化は除く）。
+    fn assert_no_more(&self) {
+        loop {
+            match self.poll(Duration::ZERO, PATIENCE) {
+                Some(None) => return,
+                Some(Some(Event::Resize(..))) => {}
+                other => panic!("余計なイベント: {other:?}"),
             }
-            Err(_) => break,
         }
     }
-    c
+
+    /// 何も無ければ `poll(100ms)` は時間切れで戻る（止まっていないときの形）。
+    fn assert_times_out(&self) {
+        loop {
+            match self.poll(Duration::from_millis(100), PATIENCE) {
+                Some(None) => return,
+                Some(Some(Event::Resize(..))) => {}
+                other => panic!("時間切れで戻らない: {other:?}"),
+            }
+        }
+    }
+
+    /// `poll(100ms)` を頼み、それが戻らない（止まっている）ことを確かめる。戻るはずの
+    /// 100 ms を大きく過ぎても答えが無ければ止まっている。止まった poll の答えは、
+    /// 後で [`Crossterm::answer`] で受ける。
+    fn assert_stuck(&self) {
+        loop {
+            match self.poll(Duration::from_millis(100), Duration::from_millis(500)) {
+                None => return,
+                // 無視にする前の SIGWINCH を拾って戻った。頼み直す。
+                Some(Some(Event::Resize(..))) => {}
+                other => panic!("poll が戻った（止まらなかった）: {other:?}"),
+            }
+        }
+    }
 }
 
 fn key(c: char) -> Event {
@@ -124,21 +134,27 @@ fn alt(c: char) -> Event {
 
 #[test]
 fn crossterm_0_29_swallows_input_after_a_mode_2031_report_and_turns_osc_answers_into_keys() {
-    let mut master = stdin_on_a_pty();
-    crossterm::terminal::enable_raw_mode().unwrap();
-    let rx = crossterm_polls();
-    let settle = Duration::from_millis(400);
-
-    // 前提: 普通のキーは届き、poll は 100 ms ごとに戻ってくる。
-    terminal_sends(&mut master, b"a");
-    let c = collect(&rx, settle);
-    assert_eq!(c.events, vec![key('a')]);
-    assert!(
-        c.polls >= 2 && c.longest < Duration::from_millis(300),
-        "{} {:?}",
-        c.polls,
-        c.longest
+    let mut pty = common::open_raw(80, 24);
+    // SAFETY: slave は開いている。fd 0 を置き換えるだけ。
+    assert_eq!(
+        unsafe { libc::dup2(pty.slave.as_raw_fd(), libc::STDIN_FILENO) },
+        libc::STDIN_FILENO
     );
+    crossterm::terminal::enable_raw_mode().unwrap();
+    let crossterm = Crossterm::start();
+    // crossterm の読み手を作り（初めての poll で作られ、SIGWINCH のハンドラも入る）、
+    // SIGWINCH を無視にする（冒頭の「SIGWINCH は無視する」）。それまでに届いた分の
+    // `Resize` は読み捨てる。
+    crossterm.assert_no_more();
+    // SAFETY: このプロセスの SIGWINCH の扱いを「無視」にするだけ。
+    unsafe { libc::signal(libc::SIGWINCH, libc::SIG_IGN) };
+    crossterm.assert_no_more();
+
+    // 前提: 普通のキーは届き、何も無ければ poll は時間切れで戻る。
+    pty.terminal_sends(b"a");
+    assert_eq!(crossterm.events(1), vec![key('a')]);
+    crossterm.assert_no_more();
+    crossterm.assert_times_out();
 
     // 1. モード 2031 の知らせ（ダーク）と、その後のキー。
     //
@@ -147,47 +163,39 @@ fn crossterm_0_29_swallows_input_after_a_mode_2031_report_and_turns_osc_answers_
     // バッファに積む。しかも入力の fd はブロッキングで、続きを待つあいだ crossterm は
     // `read(2)` で止まる: `poll(100ms)` が時間切れで戻らない（アプリのイベントループごと
     // 止まり、描き直しもタイマーも回らない）。
-    terminal_sends(&mut master, b"\x1b[?997;1n");
-    terminal_sends(&mut master, b"j");
-    terminal_sends(&mut master, b"\x1b[A"); // ↑ も同じバッファに消える
-    terminal_sends(&mut master, b"k");
-    let c = collect(&rx, settle);
-    assert_eq!(c.events, vec![], "知らせの後のキーが届かない");
-    assert_eq!(c.polls, 0, "poll が 1 度も戻らない（止まっている）");
+    pty.terminal_sends(b"\x1b[?997;1n");
+    pty.terminal_sends(b"j");
+    pty.terminal_sends(b"\x1b[A"); // ↑ も同じバッファに消える
+    pty.terminal_sends(b"k");
+    crossterm.assert_stuck();
 
-    // `c` が来て初めて「DA1 の答え」として捨てられ、バッファが空になる。`c` 自体も消える。
-    // 止まっていた poll はここで（イベント無しで）戻る。
-    terminal_sends(&mut master, b"c");
-    let c = collect(&rx, settle);
-    assert_eq!(c.events, vec![]);
-    assert!(
-        c.longest > settle,
-        "止まっていた poll の長さ: {:?}",
-        c.longest
-    );
-    terminal_sends(&mut master, b"z");
-    assert_eq!(
-        collect(&rx, settle).events,
-        vec![key('z')],
-        "その後は元どおり"
-    );
+    // `c` が来て初めて「DA1 の答え」として捨てられ、バッファが空になる。止まっていた poll は
+    // ここでイベント無しで戻る — 知らせの後ろのキーも `c` 自体も届かない。
+    pty.terminal_sends(b"c");
+    assert_eq!(crossterm.answer(PATIENCE), Some(None), "c で戻る");
+    crossterm.assert_no_more();
+    pty.terminal_sends(b"z");
+    assert_eq!(crossterm.events(1), vec![key('z')], "その後は元どおり");
+    crossterm.assert_no_more();
 
     // 2. ライトの知らせ（`CSI ? 997 ; 2 n`）も同じ。`u` でも抜ける。
-    terminal_sends(&mut master, b"\x1b[?997;2n");
-    terminal_sends(&mut master, b"x");
-    let c = collect(&rx, settle);
-    assert_eq!((c.events, c.polls), (vec![], 0));
-    terminal_sends(&mut master, b"u");
-    terminal_sends(&mut master, b"y");
-    assert_eq!(collect(&rx, settle).events, vec![key('y')]);
+    pty.terminal_sends(b"\x1b[?997;2n");
+    pty.terminal_sends(b"x");
+    crossterm.assert_stuck();
+    pty.terminal_sends(b"u");
+    assert_eq!(crossterm.answer(PATIENCE), Some(None), "u で戻る");
+    pty.terminal_sends(b"y");
+    assert_eq!(crossterm.events(1), vec![key('y')]);
+    crossterm.assert_no_more();
 
     // 3. OSC 11 の答え（問い合わせの締め切りに遅れて届いたもの）は、キーに化ける:
     // `ESC ]` が Alt+`]`、残りの文字がそれぞれ 1 つのキー、ST（`ESC \`）が Alt+`\`。
-    terminal_sends(&mut master, b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    pty.terminal_sends(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
     let mut expected = vec![alt(']')];
     expected.extend("11;rgb:ffff/ffff/ffff".chars().map(key));
     expected.push(alt('\\'));
-    assert_eq!(collect(&rx, settle).events, expected);
+    assert_eq!(crossterm.events(expected.len()), expected);
+    crossterm.assert_no_more();
 
     crossterm::terminal::disable_raw_mode().unwrap();
 }
