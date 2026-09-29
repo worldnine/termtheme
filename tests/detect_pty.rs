@@ -1,4 +1,5 @@
-//! 起動時の判定（[`termtheme::background::detect_light`]）を実物の pty で。問い合わせは stdout へ、
+//! 起動時の判定（[`termtheme::background::detect_light`]）と、プロセスに 1 つの読み手
+//! （`input::poll` / `read` / `wait_for_colors`）を実物の pty で。問い合わせは stdout へ、
 //! 答えは stdin から読むので、プロセスの fd 0 と fd 1 を pty に差し替える（fd 1 は後で戻す）。
 //! fd はプロセスに 1 組なので、テストは 1 本にまとめて順に確かめる。
 //!
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use common::PATIENCE;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use termtheme::background;
+use termtheme::colors::QueryColors;
 use termtheme::input::{self, Input};
 
 const QUERY: &[u8] = b"\x1b]11;?\x1b\\";
@@ -128,5 +130,23 @@ fn detect_light_reads_the_answer_and_hands_type_ahead_and_late_answers_to_the_re
     let got = read_n(1);
     assert_eq!(got, vec![Input::Background((0x1e, 0x1e, 0x2e))]);
     assert_eq!(got[0].light(), Some(false));
+    assert_no_more();
+
+    // 3. 色を問い合わせて答えを待つ（プロセスに 1 つの読み手で）。待つあいだに打たれたキーは
+    // 後で届く（stdin を直に読んで待つと消える）。
+    let query = QueryColors {
+        foreground: true,
+        background: true,
+        palette: vec![7],
+    };
+    pty.terminal_sends(
+        b"\x1b]10;rgb:1111/2222/3333\x1b\\x\x1b]11;rgb:44/55/66\x07\x1b]4;7;rgb:77/88/99\x1b\\y",
+    );
+    let colors = input::wait_for_colors(&query, PATIENCE).unwrap();
+    assert!(query.is_answered(&colors));
+    assert_eq!(colors.foreground, Some((0x11, 0x22, 0x33)));
+    assert_eq!(colors.background, Some((0x44, 0x55, 0x66)));
+    assert_eq!(colors.palette[7], Some((0x77, 0x88, 0x99)));
+    assert_eq!(read_n(2), vec![key('x'), key('y')]);
     assert_no_more();
 }

@@ -2,8 +2,9 @@
 //!
 //! キー・マウス・貼り付け・フォーカス・大きさの変化は crossterm と同じ
 //! [`crossterm::event::Event`] で渡し、それに加えて端末の報告 — 配色の知らせ
-//! （[`Input::ColorScheme`]、モード 2031）と背景色の答え（[`Input::Background`]、OSC 11）—
-//! を渡す。
+//! （[`Input::ColorScheme`]、モード 2031）と色の答え（背景色 [`Input::Background`]・OSC 11、
+//! 文字色 [`Input::Foreground`]・OSC 10、パレット [`Input::Palette`]・OSC 4）— を渡す。
+//! 色を問い合わせて答えが揃うまで待つには [`wait_for_colors`]（待つあいだのキーは捨てない）。
 //!
 //! # なぜ crossterm で読まないか
 //!
@@ -48,7 +49,10 @@
 //! # }
 //! ```
 //!
-//! 知らせを受けるには、端末に購読を頼む（[`crate::scheme::EnableColorSchemeUpdates`]）。
+//! 知らせを受けるには、端末に購読を頼む（[`crate::scheme::Subscription`]）。
+//!
+//! `Input` は `#[non_exhaustive]`: 端末の報告の種類はこの先も増えうるので、`match` には
+//! 上の `other =>` のような受け皿を置く（[`Input::light`] は配色についての入力をまとめて読む）。
 //!
 //! # 決まりごと
 //!
@@ -62,8 +66,8 @@
 //!   するだけで、カーソル位置は聞かない。大きさが変わったときの自動の描き直しも同じ道）。
 //!   あるいは backend の `get_cursor_position` を crossterm に問い合わせない形にする。
 //! - 端末は stdin（端末なら）か `/dev/tty` を読む（crossterm と同じ選び方）。
-//! - 入力を読むのは [`poll`] / [`read`] の中だけ（別のスレッドは立てない）。子プロセスに端末を
-//!   渡しているあいだは呼ばなければ、取り合わない（crossterm と同じ）。
+//! - 入力を読むのは [`poll`] / [`read`] / [`wait_for_colors`] の中だけ（別のスレッドは
+//!   立てない）。子プロセスに端末を渡しているあいだは呼ばなければ、取り合わない（crossterm と同じ）。
 
 mod parse;
 
@@ -77,11 +81,13 @@ use std::time::{Duration, Instant};
 use crossterm::event::Event;
 
 use crate::background::{self, Rgb};
+use crate::colors::{Colors, QueryColors};
 use crate::scheme::ColorScheme;
 use parse::{InternalEvent, Parser};
 
-/// 読んだ 1 つの入力。
+/// 読んだ 1 つの入力。種類はこの先も増えうる（`match` には受け皿を置く）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Input {
     /// crossterm と同じ入力（キー・マウス・貼り付け・フォーカス・大きさの変化）。
     Event(Event),
@@ -90,6 +96,10 @@ pub enum Input {
     /// OSC 11 の答え（背景色）。[`crate::background::QueryBackground`] への答えや、
     /// 起動時の判定の締め切りに遅れて届いた答え。
     Background(Rgb),
+    /// OSC 10 の答え（文字色）。[`crate::colors::QueryForeground`] への答え。
+    Foreground(Rgb),
+    /// OSC 4 の答え（パレットの番と色）。[`crate::colors::QueryPalette`] への答え。
+    Palette(u8, Rgb),
 }
 
 impl Input {
@@ -99,7 +109,7 @@ impl Input {
         match self {
             Self::ColorScheme(scheme) => Some(scheme.is_light()),
             Self::Background(rgb) => Some(background::is_light(*rgb)),
-            Self::Event(_) => None,
+            Self::Event(_) | Self::Foreground(_) | Self::Palette(..) => None,
         }
     }
 }
@@ -171,23 +181,73 @@ impl Reader {
         }
         let deadline = Instant::now().checked_add(timeout);
         loop {
-            let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-            let ready = wait(self.tty.raw(), self.winch.rx.as_raw_fd(), left)?;
-            if ready.winch && self.winch.drain() {
-                let (columns, rows) = size(self.tty.raw())?;
-                self.parser
-                    .push_event(InternalEvent::Event(Event::Resize(columns, rows)));
-                self.collect();
-            }
-            if ready.tty {
-                self.fill()?;
-            }
+            self.wait_once(deadline)?;
             if !self.inputs.is_empty() {
                 return Ok(true);
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(false);
             }
+        }
+    }
+
+    /// 端末か SIGWINCH を `deadline` まで 1 回待ち、届いたものを読んで `inputs` に積む
+    /// （`None` は無期限）。何も積まずに戻ることもある（シグナルで起こされた・時間切れ）。
+    fn wait_once(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let ready = wait(self.tty.raw(), self.winch.rx.as_raw_fd(), left)?;
+        if ready.winch && self.winch.drain() {
+            let (columns, rows) = size(self.tty.raw())?;
+            self.parser
+                .push_event(InternalEvent::Event(Event::Resize(columns, rows)));
+            self.collect();
+        }
+        if ready.tty {
+            self.fill()?;
+        }
+        Ok(())
+    }
+
+    /// 色の問い合わせ（`query`）への答えを、揃うか `timeout` まで待つ。**`query` を端末へ送って
+    /// から、読み手を回す前に呼ぶ。**
+    ///
+    /// 待つあいだは読み手を回し、`query` が頼んだ色の答えを集めて返す。答えでない入力
+    /// （待つあいだに打たれたキー、配色の知らせ、頼んでいない色の答え、2 度目の答え）は捨てずに
+    /// 取っておき、この後の [`Reader::poll`] / [`Reader::read`] で、呼ぶ前から溜まっていた入力の
+    /// 後ろに届いた順で返す。呼ぶ前から溜まっていた入力は、この問い合わせの答えとして読まない
+    /// （前の問い合わせに遅れて届いた答えかもしれない）。
+    ///
+    /// 時間切れでも誤りにはせず、揃った分だけを返す（答えない端末では全部 `None`。揃ったかは
+    /// [`QueryColors::is_answered`]）。締め切りに遅れた答えは、後で `Input` として届く。
+    pub fn wait_for_colors(
+        &mut self,
+        query: &QueryColors,
+        timeout: Duration,
+    ) -> io::Result<Colors> {
+        let mut colors = Colors::default();
+        self.take_stash();
+        let earlier = std::mem::take(&mut self.inputs);
+        let result = self.gather(query, &mut colors, timeout);
+        let during = std::mem::replace(&mut self.inputs, earlier);
+        self.inputs.extend(during);
+        result.map(|()| colors)
+    }
+
+    /// [`Reader::wait_for_colors`] の中身: `inputs` に積まれた答えを `colors` へ移しながら待つ。
+    fn gather(
+        &mut self,
+        query: &QueryColors,
+        colors: &mut Colors,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            self.inputs
+                .retain(|input| !take_answer(query, colors, input));
+            if query.is_answered(colors) || deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(());
+            }
+            self.wait_once(deadline)?;
         }
     }
 
@@ -254,6 +314,8 @@ impl Reader {
                 InternalEvent::Event(event) => Input::Event(event),
                 InternalEvent::ColorScheme(scheme) => Input::ColorScheme(scheme),
                 InternalEvent::Background(rgb) => Input::Background(rgb),
+                InternalEvent::Foreground(rgb) => Input::Foreground(rgb),
+                InternalEvent::Palette(n, rgb) => Input::Palette(n, rgb),
                 InternalEvent::CursorPosition(..)
                 | InternalEvent::KeyboardEnhancementFlags(_)
                 | InternalEvent::PrimaryDeviceAttributes
@@ -285,6 +347,29 @@ pub fn poll(timeout: Duration) -> io::Result<bool> {
 /// crossterm の `event::read` の代わり。
 pub fn read() -> io::Result<Input> {
     with_reader(|reader| reader.read())
+}
+
+/// 色の問い合わせへの答えを、揃うか `timeout` まで待つ（[`Reader::wait_for_colors`]。
+/// 待つあいだに届いたキーは、この後の [`poll`] / [`read`] で届く）。
+pub fn wait_for_colors(query: &QueryColors, timeout: Duration) -> io::Result<Colors> {
+    with_reader(|reader| reader.wait_for_colors(query, timeout))
+}
+
+/// `input` が `query` の頼んだ色で、まだ答えの無いものなら `colors` に書いて `true`。
+fn take_answer(query: &QueryColors, colors: &mut Colors, input: &Input) -> bool {
+    let (slot, rgb) = match *input {
+        Input::Foreground(rgb) if query.foreground => (&mut colors.foreground, rgb),
+        Input::Background(rgb) if query.background => (&mut colors.background, rgb),
+        Input::Palette(n, rgb) if query.palette.contains(&n) => {
+            (&mut colors.palette[usize::from(n)], rgb)
+        }
+        _ => return false,
+    };
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(rgb);
+    true
 }
 
 /// 起動時の判定が読んだが答えではなかったバイト（先打ち）。次に読み手が読む。

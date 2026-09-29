@@ -19,10 +19,20 @@
 //! プログラム（シェル、Enter で開いた別の TUI）に知らせが届き、crossterm で読むものは
 //! そこで止まる。終わるとき・子プロセスに端末を渡すとき（suspend）は
 //! [`DisableColorSchemeUpdates`] を送り、戻ったら [`EnableColorSchemeUpdates`] を送り直す。
+//!
+//! この張り外しは [`Subscription`] が受け持つ（落とせば外す、`suspend` / `resume` で
+//! 子に渡すあいだは外す、固定なら何もしない）。シグナルハンドラからは
+//! [`unsubscribe_in_signal_handler`]。列を自分で送るなら、下の `Command` と列の定数。
 
 use std::fmt;
 
 use crossterm::Command;
+
+#[cfg(unix)]
+mod subscription;
+
+#[cfg(unix)]
+pub use subscription::{Subscription, unsubscribe_in_signal_handler};
 
 /// 端末の配色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,7 +65,8 @@ impl ColorScheme {
 
 /// 購読を始める列。
 pub const ENABLE_UPDATES: &str = "\x1b[?2031h";
-/// 購読を終える列。
+/// 購読を終える列。シグナルハンドラから書くなら `DISABLE_UPDATES.as_bytes()` を `write(2)`
+/// する（[`unsubscribe_in_signal_handler`] はそれを、張っているときだけする）。
 pub const DISABLE_UPDATES: &str = "\x1b[?2031l";
 /// 今の配色を問い合わせる列。
 pub const QUERY: &str = "\x1b[?996n";

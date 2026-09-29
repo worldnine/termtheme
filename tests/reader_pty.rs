@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::PATIENCE;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use termtheme::colors::QueryColors;
 use termtheme::input::{Input, Reader};
 use termtheme::scheme::ColorScheme;
 
@@ -120,6 +121,106 @@ fn background_answers_arrive_as_input_instead_of_keys() {
     assert_eq!(got[0].light(), Some(true));
     assert_eq!(got[1].light(), None);
     assert_eq!(Input::ColorScheme(ColorScheme::Dark).light(), Some(false));
+}
+
+#[test]
+fn foreground_and_palette_answers_arrive_as_input_instead_of_keys() {
+    let mut pty = common::open_raw(80, 24);
+    let mut reader = Reader::from_fd(pty.slave.try_clone().unwrap()).unwrap();
+
+    pty.terminal_sends(b"\x1b]10;rgb:e0e0/e2e2/eaea\x1b\\\x1b]4;1;rgb:cdcd/0000/0000\x07q");
+    let got = read_n(&mut reader, 3);
+    assert_eq!(
+        got,
+        vec![
+            Input::Foreground((0xe0, 0xe2, 0xea)),
+            Input::Palette(1, (0xcd, 0, 0)),
+            key('q'),
+        ]
+    );
+    assert_no_more(&mut reader);
+    // 明るさは背景色と配色の知らせだけで決める。
+    assert_eq!(got[0].light(), None);
+    assert_eq!(got[1].light(), None);
+}
+
+#[test]
+fn waiting_for_colors_gathers_the_answers_and_keeps_the_keys_typed_meanwhile() {
+    let mut pty = common::open_raw(80, 24);
+    let mut reader = Reader::from_fd(pty.slave.try_clone().unwrap()).unwrap();
+
+    // 待つ前から読み手に溜まっていた入力: キーと、前の問い合わせに遅れて届いた文字色の答え。
+    // この問い合わせの答えとしては読まない。
+    pty.terminal_sends(b"a\x1b]10;rgb:00/00/00\x1b\\");
+    assert!(reader.poll(Duration::ZERO).unwrap());
+
+    // 問い合わせの答えと、そのあいだに打たれたキー・届いた知らせ・頼んでいない色の答え。
+    let query = QueryColors {
+        foreground: true,
+        background: true,
+        palette: vec![0, 1],
+    };
+    pty.terminal_sends(
+        b"j\x1b]10;rgb:e0/e2/ea\x1b\\\x1b]11;rgb:14/16/1b\x07k\x1b[?997;2n\
+          \x1b]4;0;rgb:00/00/00\x1b\\\x1b]4;5;rgb:55/55/55\x1b\\\x1b]4;1;rgb:ff/00/00\x1b\\l",
+    );
+    let start = Instant::now();
+    let colors = reader.wait_for_colors(&query, PATIENCE).unwrap();
+    assert!(start.elapsed() < PATIENCE, "揃ったら締め切りを待たずに戻る");
+    assert!(query.is_answered(&colors));
+    assert_eq!(
+        colors.foreground,
+        Some((0xe0, 0xe2, 0xea)),
+        "待つ前の答えではない"
+    );
+    assert_eq!(colors.background, Some((0x14, 0x16, 0x1b)));
+    assert_eq!(colors.palette[0], Some((0, 0, 0)));
+    assert_eq!(colors.palette[1], Some((0xff, 0, 0)));
+    assert_eq!(colors.palette[5], None, "頼んでいない");
+
+    // 答えでない入力は、待つ前からの分の後ろに、届いた順で残っている。
+    assert_eq!(
+        read_n(&mut reader, 7),
+        vec![
+            key('a'),
+            Input::Foreground((0, 0, 0)),
+            key('j'),
+            key('k'),
+            Input::ColorScheme(ColorScheme::Light),
+            Input::Palette(5, (0x55, 0x55, 0x55)),
+            key('l'),
+        ]
+    );
+    assert_no_more(&mut reader);
+}
+
+#[test]
+fn waiting_for_colors_gives_up_on_time_and_late_answers_arrive_as_input() {
+    let mut pty = common::open_raw(80, 24);
+    let mut reader = Reader::from_fd(pty.slave.try_clone().unwrap()).unwrap();
+
+    // 背景色だけ答える端末。
+    let query = QueryColors::ansi();
+    pty.terminal_sends(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    let start = Instant::now();
+    let colors = reader
+        .wait_for_colors(&query, Duration::from_millis(100))
+        .unwrap();
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(100) && took < PATIENCE,
+        "{took:?}"
+    );
+    assert!(!query.is_answered(&colors));
+    assert_eq!(colors.background, Some((255, 255, 255)), "揃った分は返す");
+    assert_eq!(colors.foreground, None);
+    assert_eq!(colors.ansi(), None);
+    assert_no_more(&mut reader);
+
+    // 締め切りに遅れた答えは、捨てずに入力として届く。
+    pty.terminal_sends(b"\x1b]10;rgb:00/00/00\x1b\\");
+    assert_eq!(read_n(&mut reader, 1), vec![Input::Foreground((0, 0, 0))]);
+    assert_no_more(&mut reader);
 }
 
 #[test]
