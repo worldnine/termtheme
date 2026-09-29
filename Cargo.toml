@@ -1,6 +1,6 @@
 [package]
 name = "termtheme"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Light/dark plumbing for ratatui + syntect TUIs: OSC 11 background detection, mode 2031 color-scheme notifications, theme resolution, and a [theme] config section."
 license = "MIT"

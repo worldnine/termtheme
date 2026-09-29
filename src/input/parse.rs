@@ -10,9 +10,10 @@
 //!   （`tests/crossterm_2031.rs`）。どの終端バイトでも列を閉じるようにした
 //! - `CSI >` / `CSI =`（DA2 などの答え）も同じく終端バイトまでを 1 つの列として捨てる
 //!   （crossterm は 3 バイト目で諦め、残りが文字のキーになる）
-//! - OSC の答え（`ESC ] 11 ; rgb:… ST`）を読む。crossterm は `ESC ]` を Alt+`]` にし、
-//!   残りを文字のキーにする。ここは [`Parser`] が受け持つ（`parse_event` の手前で見る）
-//! - 内部の [`InternalEvent`] に `ColorScheme` / `Background` / `Ignored` を足した
+//! - OSC の答え（`ESC ] 11 ; rgb:… ST`、OSC 10・4 も）を読む。crossterm は `ESC ]` を Alt+`]`
+//!   にし、残りを文字のキーにする。ここは [`Parser`] が受け持つ（`parse_event` の手前で見る）
+//! - 内部の [`InternalEvent`] に `ColorScheme` / `Background` / `Foreground` / `Palette` /
+//!   `Ignored` を足した
 //!
 //! 元のライセンス（MIT）:
 //!
@@ -51,7 +52,8 @@ use crossterm::event::{
     MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::background::{self, Rgb};
+use crate::background::Rgb;
+use crate::colors::{self, Answer};
 use crate::scheme::ColorScheme;
 
 /// 読んだ 1 つの列。crossterm の `InternalEvent` に、termtheme: 端末の報告を足したもの。
@@ -69,7 +71,12 @@ pub(crate) enum InternalEvent {
     ColorScheme(ColorScheme),
     /// termtheme: OSC 11 の答え（背景色）。
     Background(Rgb),
-    /// termtheme: 読んで捨てる端末の報告（OSC 10 / 4 の答え、知らない `CSI ? … n` など）。
+    /// termtheme: OSC 10 の答え（文字色）。
+    Foreground(Rgb),
+    /// termtheme: OSC 4 の答え（パレットの番と色）。
+    Palette(u8, Rgb),
+    /// termtheme: 読んで捨てる端末の報告（知らない OSC の答え、読めない色、知らない
+    /// `CSI ? … n` など）。
     Ignored,
 }
 
@@ -994,8 +1001,8 @@ impl Parser {
         if self.buffer.starts_with(b"\x1B]") {
             match osc_step(&self.buffer, more) {
                 Osc::Wait => {}
-                Osc::Done(ie) => {
-                    self.events.push_back(ie);
+                Osc::Done => {
+                    self.events.extend(osc_events(&self.buffer));
                     self.buffer.clear();
                 }
                 Osc::Replay { event, from } => {
@@ -1025,8 +1032,8 @@ impl Parser {
 enum Osc {
     /// 続きを待つ。
     Wait,
-    /// 答えを読み終えた。
-    Done(InternalEvent),
+    /// 答えを読み終えた（バッファの全部が 1 つの答え。中身は [`osc_events`]）。
+    Done,
     /// 答えではなかった（あるいは途中で壊れた）: `event` を出し、`from` から後ろを
     /// 普通の入力として読み直す。
     Replay {
@@ -1071,7 +1078,7 @@ fn osc_step(buffer: &[u8], more: bool) -> Osc {
     let last = buffer[len - 1];
     if len >= content + 2 && buffer[len - 2] == b'\x1B' {
         return if last == b'\\' {
-            Osc::Done(osc_event(buffer))
+            Osc::Done
         } else {
             Osc::Replay {
                 event: None,
@@ -1080,7 +1087,7 @@ fn osc_step(buffer: &[u8], more: bool) -> Osc {
         };
     }
     match last {
-        b'\x07' => Osc::Done(osc_event(buffer)),
+        b'\x07' => Osc::Done,
         b'\x1B' => Osc::Wait,
         0x00..=0x1F | 0x7F => Osc::Replay {
             event: None,
@@ -1094,9 +1101,23 @@ fn osc_step(buffer: &[u8], more: bool) -> Osc {
     }
 }
 
-/// 読み終えた OSC の答え。OSC 11（背景色）だけを読み、ほかは捨てる。
-fn osc_event(buffer: &[u8]) -> InternalEvent {
-    background::parse_osc11(buffer).map_or(InternalEvent::Ignored, InternalEvent::Background)
+/// 読み終えた OSC の答え。色の答え（OSC 10・11・4、[`colors::parse_answer`]）を読み、ほかと
+/// 読めない色は 1 つの `Ignored` にして捨てる。OSC 4 は 1 つの答えに番と色を並べる端末もあり、
+/// そのときは組の数だけ出す。
+fn osc_events(buffer: &[u8]) -> Vec<InternalEvent> {
+    let events: Vec<_> = colors::parse_answer(buffer)
+        .into_iter()
+        .map(|answer| match answer {
+            Answer::Foreground(rgb) => InternalEvent::Foreground(rgb),
+            Answer::Background(rgb) => InternalEvent::Background(rgb),
+            Answer::Palette(n, rgb) => InternalEvent::Palette(n, rgb),
+        })
+        .collect();
+    if events.is_empty() {
+        vec![InternalEvent::Ignored]
+    } else {
+        events
+    }
 }
 
 fn alt(c: char) -> InternalEvent {
@@ -1861,18 +1882,51 @@ mod tests {
             feed_chunks(&[b"\x1B]1", b"1;rgb:ff", b"ff/ffff/ffff\x1B", b"\\", b"j"]),
             vec![white, char_key('j')]
         );
-        // 読めない色の答えと、ほかの OSC の答え（文字色・16 色）は捨てる。
+        // 読めない色の答えは捨てる。
         assert_eq!(
             feed(b"\x1B]11;rgb:zz/zz/zz\x07"),
             vec![InternalEvent::Ignored]
         );
+    }
+
+    #[test]
+    fn osc_10_and_4_answers_become_foreground_and_palette_reports() {
         assert_eq!(
-            feed(b"\x1B]10;rgb:0/0/0\x1B\\"),
-            vec![InternalEvent::Ignored]
+            feed(b"\x1B]10;rgb:0/0/0\x1B\\j"),
+            vec![InternalEvent::Foreground((0, 0, 0)), char_key('j')]
         );
         assert_eq!(
             feed(b"\x1B]4;1;rgb:cd/0/0\x07"),
-            vec![InternalEvent::Ignored]
+            vec![InternalEvent::Palette(1, (0xcd, 0, 0))]
+        );
+        // 続けて届いた答え（16 色をまとめて問い合わせたとき）も、境目で切れた答えも 1 つずつ。
+        assert_eq!(
+            feed_chunks(&[
+                b"\x1B]4;0;rgb:00/00/00\x1B\\\x1B]4;1;rgb:ff",
+                b"/00/00\x1B\\k"
+            ]),
+            vec![
+                InternalEvent::Palette(0, (0, 0, 0)),
+                InternalEvent::Palette(1, (255, 0, 0)),
+                char_key('k'),
+            ]
+        );
+        // 1 つの答えに組を並べる端末では、組の数だけ。
+        assert_eq!(
+            feed(b"\x1B]4;1;rgb:ff/00/00;2;rgb:00/ff/00\x07"),
+            vec![
+                InternalEvent::Palette(1, (255, 0, 0)),
+                InternalEvent::Palette(2, (0, 255, 0)),
+            ]
+        );
+        // 読めない色・知らない OSC（カーソルの色など）は捨て、後ろのキーは生きる。
+        assert_eq!(
+            feed(b"\x1B]4;1;rgb:zz/0/0\x07\x1B]12;rgb:ff/ff/ff\x1B\\x"),
+            vec![
+                InternalEvent::Ignored,
+                InternalEvent::Ignored,
+                char_key('x')
+            ]
         );
     }
 

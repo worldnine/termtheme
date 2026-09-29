@@ -9,7 +9,8 @@
 //! - [`ThemeSection`] — アプリの設定の構造体に埋め込む serde の型。**知らないキーは断る**
 //!   （`[theme] drak = …` のタイプミスを黙って無視しない）
 //! - [`ThemeSection::into_pair`] — 空・空白だけの値は書いていないのと同じにし、`~/` を
-//!   展開する（`.tmTheme` のパス用）
+//!   展開する（`.tmTheme` のパス用）。その 2 つは [`non_blank`]・[`expand_home`] として
+//!   `[theme]` の外のキーにも使える
 //! - [`config_dir`] — 設定ディレクトリ: `$XDG_CONFIG_HOME/<アプリ名>`、無ければ
 //!   `~/.config/<アプリ名>`（空の `XDG_CONFIG_HOME` は無いのと同じ）
 //! - [`ThemeFlags::over`] — フラグとの重ね方: `--theme`（両側）> `--theme-dark` /
@@ -53,6 +54,9 @@ impl ThemeSection {
 }
 
 /// 空・空白だけは書いていないのと同じ。
+///
+/// `[theme]` の外のキーにも使ってよい（akapen は `semantic_cmd` などの設定の値にも使う）。
+/// そのために公開してある — `[theme]` のための内側の関数にしない。
 pub fn non_blank(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.trim().is_empty())
 }

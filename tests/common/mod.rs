@@ -32,14 +32,16 @@ pub fn open_raw(columns: u16, rows: u16) -> Pty {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // SAFETY: 出力先の fd 2 つと winsize を渡す（macOS は `*mut`、Linux は `*const` を取る）。
+    // SAFETY: 出力先の fd 2 つと winsize を渡す。winsize は macOS が `*mut`、Linux が `*const`
+    // を取るので、生のポインタで渡す（`*mut` は `*const` にもなる。`&mut` で渡すと、Linux の
+    // clippy が mut は要らないと言う）。
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         )
     };
     assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
@@ -76,6 +78,15 @@ impl Pty {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// 端末が送ったことにする — **読み手が `read(2)` で待っているとき**に使う（止まった
+    /// crossterm の読み手など）。読み手は届いたそばから読むので、入力の列に載るのは待たない
+    /// （[`Pty::terminal_sends`] で待つと、Linux では載る前に読まれて待ちが終わらない）。
+    /// 読まれたことは、読み手の側の結果で確かめる。
+    pub fn terminal_sends_to_waiting_reader(&mut self, bytes: &[u8]) {
+        self.master.write_all(bytes).unwrap();
+        self.master.flush().unwrap();
     }
 
     /// アプリの側でまだ読まれていないバイトの数。
