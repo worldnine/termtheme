@@ -1,0 +1,29 @@
+# テストと clippy を push / PR ごとに Linux と macOS の両方で流す
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      # 片方の OS で落ちても、もう片方の結果を見る。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # pty を使うテストは OS で振る舞いが違う（Linux の pty は書いたバイトを少し遅れて渡す、
+      # macOS の poll(2) は /dev/tty を受け付けない、など）ので、どちらでも流す。
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets -- -D warnings
