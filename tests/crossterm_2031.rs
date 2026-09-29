@@ -12,7 +12,9 @@
 //! すると、区間をまたいだ結果が混ざる）。送ったバイトは入力の列に全部載ったのを確かめてから
 //! poll を頼むので、crossterm はそれを 1 回で読む。「止まっている」は、その poll が
 //! `c` を送るまで戻らないこと（戻るはずの 100 ms を大きく過ぎても答えが無く、`c` で戻る）と、
-//! 知らせの後ろのキーが 1 つも届かないことで確かめる。
+//! 知らせの後ろのキーが 1 つも届かないことで確かめる。止まった crossterm は `read(2)` で
+//! 待っているので、`c` は列に載るのを待たずに送る（載ったそばから読まれる。Linux の pty では
+//! 載ったところを見られない）。
 //!
 //! # SIGWINCH は無視する
 //!
@@ -170,8 +172,9 @@ fn crossterm_0_29_swallows_input_after_a_mode_2031_report_and_turns_osc_answers_
     crossterm.assert_stuck();
 
     // `c` が来て初めて「DA1 の答え」として捨てられ、バッファが空になる。止まっていた poll は
-    // ここでイベント無しで戻る — 知らせの後ろのキーも `c` 自体も届かない。
-    pty.terminal_sends(b"c");
+    // ここでイベント無しで戻る — 知らせの後ろのキーも `c` 自体も届かない。止まった crossterm は
+    // `read(2)` で待っているので、`c` はそのまま読まれる（入力の列に載るのは待たない）。
+    pty.terminal_sends_to_waiting_reader(b"c");
     assert_eq!(crossterm.answer(PATIENCE), Some(None), "c で戻る");
     crossterm.assert_no_more();
     pty.terminal_sends(b"z");
@@ -182,7 +185,7 @@ fn crossterm_0_29_swallows_input_after_a_mode_2031_report_and_turns_osc_answers_
     pty.terminal_sends(b"\x1b[?997;2n");
     pty.terminal_sends(b"x");
     crossterm.assert_stuck();
-    pty.terminal_sends(b"u");
+    pty.terminal_sends_to_waiting_reader(b"u");
     assert_eq!(crossterm.answer(PATIENCE), Some(None), "u で戻る");
     pty.terminal_sends(b"y");
     assert_eq!(crossterm.events(1), vec![key('y')]);
